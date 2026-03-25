@@ -1,0 +1,464 @@
+================================================================================
+SECURITY ARCHITECTURE DIAGRAM - AI IMMIGRATION FORM TOOL
+================================================================================
+
+1. CLIENT-SIDE ENCRYPTION FLOW
+================================================================================
+
+User Input (Plaintext)
+    ↓ [Password + Salt]
+    ↓
+PBKDF2-SHA256 (600K iterations)
+    ↓
+User Encryption Key (never transmitted)
+    ↓ [AES-256-GCM]
+    ↓
+Encrypted Blob (ciphertext + IV)
+    ↓
+Send to Server (HTTPS/TLS 1.3)
+
+
+RESULT: Server receives only encrypted data. Cannot decrypt without user password.
+
+
+2. FULL DATA FLOW WITH SERVER ENCRYPTION
+================================================================================
+
+┌──────────────────────────────────┐
+│  Browser/Mobile App              │
+│  ├─ User enters SSN, passport    │
+│  ├─ Client-side encryption       │
+│  │  (AES-256-GCM)                │
+│  └─ Send: encrypted blob only    │
+└─────────────────┬────────────────┘
+                  │
+                  ↓ [HTTPS/TLS 1.3]
+                  │ Certificate pinning
+                  │
+┌─────────────────────────────────────────────┐
+│  Application Server (Private VPC)           │
+│                                            │
+│  1. Validate request signature             │
+│  2. Decrypt (using master key from Vault) │
+│  3. Validate PII (server-side)            │
+│  4. Re-encrypt (redundancy)               │
+│  5. Store encrypted blob in DB            │
+│  6. Shred plaintext from memory           │
+│  7. Log: encrypted_field_id, timestamp    │
+│     (NEVER log plaintext)                 │
+└─────────────────┬───────────────────────────┘
+                  │
+                  ↓
+┌─────────────────────────────────────────────┐
+│  PostgreSQL Database (Private Subnet)      │
+│                                            │
+│  Column: ssn_encrypted                    │
+│  Value: <AES-256-GCM ciphertext>          │
+│  + RLS: users see only own rows           │
+│  + SSL: all connections encrypted         │
+└─────────────────────────────────────────────┘
+
+
+3. LLM API REDACTION PATTERN (CRITICAL FOR PII)
+================================================================================
+
+Server has form data (encrypted):
+    ↓
+Decrypt (only in memory, within server process)
+    ↓
+REDACT:
+  SSN "123-45-6789" → "ssn_valid: true, ssn_digits: 9"
+  Passport "AB123456" → "passport_valid: true"
+  DoB "1990-01-15" → "age_over_18: true"
+  Address "123 Main St" → "[REDACTED]"
+    ↓
+Create safe payload:
+{
+  "form_type": "I-130",
+  "ssn_valid": true,
+  "passport_valid": true,
+  "visa_status": "F-1",
+  "employment_years": 2,
+  "inconsistencies": ["employment_dates_overlap"]
+}
+    ↓ [HTTPS + API key]
+    ↓
+Call Claude/OpenAI API (redacted data only)
+    ↓
+Receive response: risk_assessment, flags, warnings
+    ↓
+Shred plaintext from memory (critical!)
+    ↓
+Encrypt response + return to client
+
+
+RESULT: Claude/OpenAI never sees raw PII. Cannot be retained, cannot be logged.
+
+
+4. KEY MANAGEMENT & ROTATION
+================================================================================
+
+User Password (input)
+    ↓
+PBKDF2-SHA256 (600K iterations)
+    ↓
+User Encryption Key (stored in browser memory only, expires on logout)
+
+────────────────────────────────────────
+
+Master Key (Server-Side)
+    ↓
+AWS Secrets Manager (encrypted)
+    ↓
+AWS KMS (key encryption key)
+    ↓
+CloudTrail audit log
+    ↓
+Quarterly automatic rotation:
+  1. New key generated
+  2. Old data re-encrypted with new key
+  3. Old key deleted
+  4. Transparent to users
+
+
+────────────────────────────────────────
+
+API Keys (OpenAI/Claude)
+    ↓
+AWS Secrets Manager (never in env vars)
+    ↓
+Separate key per environment (dev/staging/prod)
+    ↓
+Quarterly rotation
+    ↓
+Scoped to specific endpoints if provider supports
+
+
+5. ACCESS CONTROL & AUTHENTICATION
+================================================================================
+
+┌──────────────────────────────┐
+│  User Login                  │
+├──────────────────────────────┤
+│  Email + Password            │
+│  ↓                          │
+│  OAuth2 (Google/Microsoft)   │
+│  ↓                          │
+│  bcrypt hash verification    │
+└──────────┬───────────────────┘
+           ↓
+┌──────────────────────────────┐
+│  JWT Token Issued            │
+├──────────────────────────────┤
+│  Payload: user_id, role      │
+│  Expiry: 15 minutes          │
+│  Refresh token: 7 days       │
+│  Signed: HMAC-SHA256         │
+└──────────┬───────────────────┘
+           ↓
+┌──────────────────────────────────────┐
+│  Each API Request                    │
+├──────────────────────────────────────┤
+│  Authorization: Bearer <JWT>         │
+│  + Optional: X-Request-Signature     │
+│  (HMAC-SHA256(body + timestamp))     │
+│  + Rate limit check (100 req/min)    │
+│  + IP whitelist (corporate VPN only) │
+└──────────────────────────────────────┘
+
+EMPLOYEE ACCESS (Zero-Trust):
+  ┌─────────────────────┐
+  │  VPN connection     │
+  │  required           │
+  └────────┬────────────┘
+           ↓
+  ┌─────────────────────┐
+  │  MFA (TOTP + HW key)│
+  │  required           │
+  └────────┬────────────┘
+           ↓
+  ┌─────────────────────────────┐
+  │  AWS IAM role                │
+  │  (time-scoped, minimal      │
+  │   permissions)              │
+  └────────┬────────────────────┘
+           ↓
+  ┌──────────────────────────────┐
+  │  Database read/write access  │
+  │  (row-level security)        │
+  │  All queries logged          │
+  └──────────────────────────────┘
+
+
+6. INFRASTRUCTURE SECURITY LAYERS
+================================================================================
+
+                    Internet
+                       ↓
+         ┌─────────────────────────────┐
+         │  CloudFlare (DDoS + WAF)    │
+         │  ├─ OWASP Top 10 rules      │
+         │  ├─ Rate limiting           │
+         │  └─ Geo-blocking            │
+         └────────────┬────────────────┘
+                      ↓
+         ┌────────────────────────────────┐
+         │  AWS ALB/NLB                   │
+         │  ├─ HTTPS termination         │
+         │  ├─ Certificate validation    │
+         │  └─ Request signing check     │
+         └────────────┬───────────────────┘
+                      ↓
+         ┌──────────────────────────────────┐
+         │  VPC (Virtual Private Cloud)    │
+         │  ├─ Public subnet: ALB          │
+         │  └─ Private subnet: App servers │
+         └────────────┬─────────────────────┘
+                      ↓
+         ┌────────────────────────────────────┐
+         │  ECS Fargate (App Servers)        │
+         │  ├─ Auto-scaling (CPU/memory)    │
+         │  ├─ No outbound internet access  │
+         │  ├─ Security groups (whitelist)  │
+         │  └─ All traffic encrypted        │
+         └────────────┬──────────────────────┘
+          ┌───────────┼───────────┐
+          ↓           ↓           ↓
+    ┌──────────┐ ┌──────────┐ ┌──────────┐
+    │ RDS      │ │ Vault    │ │ Lambda   │
+    │ (Data)   │ │ (Secrets)│ │(LLM API) │
+    │ Encrypted│ │Encrypted │ │(isolated)│
+    │ + Backup │ │ + CloudT │ │No DB     │
+    │ + RLS    │ │ rail log │ │access    │
+    └──────────┘ └──────────┘ └──────────┘
+
+
+7. ZERO-KNOWLEDGE PROOF FLOW (Optional Phase 2)
+================================================================================
+
+┌─────────────────────────────────────┐
+│  Client (Browser)                   │
+├─────────────────────────────────────┤
+│  Plaintext SSN: "123-45-6789"       │
+│                                    │
+│  Generate ZK commitment:           │
+│  ├─ ssn_hash = SHA256("123456789")│
+│  ├─ range_proof = ZK.prove(       │
+│  │    value="123456789",          │
+│  │    range=(0, 999999999),       │
+│  │    length=9                    │
+│  │  )                              │
+│  └─ encrypted_ssn = AES-256(ssn)   │
+│                                    │
+│  Send: {                           │
+│    encrypted_ssn: <ciphertext>,   │
+│    ssn_hash: <sha256>,            │
+│    range_proof: <proof>           │
+│  }                                 │
+└────────────┬──────────────────────┘
+             ↓ [HTTPS]
+┌────────────────────────────────────┐
+│  Server                            │
+├────────────────────────────────────┤
+│  Verify ZK proof:                 │
+│  ├─ ZK.verify(range_proof)        │
+│  ├─ Confirm: value is 9 digits    │
+│  └─ NEVER decrypt encrypted_ssn   │
+│                                   │
+│  If proof valid:                  │
+│  ├─ Flag: SSN format is valid     │
+│  ├─ Store: encrypted blob (as-is) │
+│  ├─ Log: proof verified, timestamp│
+│  └─ Return: validation success    │
+│                                   │
+│  Result: Server confirmed SSN     │
+│  format WITHOUT seeing plaintext. │
+└────────────────────────────────────┘
+
+
+8. BACKUP & DISASTER RECOVERY
+================================================================================
+
+Daily Automated Backups:
+
+  PostgreSQL RDS Instance (Primary)
+         ↓
+         ├→ Automated backup (daily, 35-day retention)
+         │  └→ Encrypted (AWS native)
+         │
+         ├→ Cross-region replica
+         │  └→ Async replication (geo-redundant)
+         │
+         └→ Archive to S3 (for compliance, encrypted)
+
+Recovery Path:
+  Disaster detected
+         ↓
+  Automated alert (PagerDuty)
+         ↓
+  Launch recovery RDS instance from backup
+         ↓
+  Point-in-time restore (select timestamp)
+         ↓
+  Verify: data integrity, recovery time
+         ↓
+  Promote: new instance as primary
+         ↓
+  RTO target: < 1 hour
+         ↓
+  RPO target: < 15 minutes
+
+
+Monthly Test:
+  ├─ Restore from backup to test environment
+  ├─ Verify: data integrity, recovery time
+  ├─ Document: RTO/RPO actual results
+  └─ Alert: if metrics exceed targets
+
+
+9. INCIDENT RESPONSE & ESCALATION
+================================================================================
+
+Level 1: Automated Alert (Real-Time)
+  ├─ Failed decryption attempts (>5/minute) → Page on-call engineer
+  ├─ API key usage anomaly → Block API key, investigate
+  ├─ Database access from unexpected IP → Log, alert
+  ├─ SSL certificate expiry (<30 days) → Auto-renew + alert
+  └─ Rate limit breach (>100 req/min) → Trigger WAF block
+
+Level 2: Manual Investigation (Within 15 minutes)
+  ├─ Engineer reviews alert
+  ├─ Checks audit logs (CloudTrail, database logs)
+  ├─ Determines: suspicious activity or false positive?
+  ├─ If suspicious: escalate to CISO
+  └─ Actions: rotate keys, revoke tokens, block IPs
+
+Level 3: Data Breach Response (Within 1 hour)
+  ├─ CISO notified
+  ├─ Legal counsel contacted
+  ├─ Affected users identified (encrypted data only?)
+  ├─ Notification email drafted (within 24 hours)
+  ├─ Authorities notified if required (state AG, etc.)
+  └─ Post-mortem scheduled (within 48 hours)
+
+Level 4: Recovery (Within 24 hours)
+  ├─ Root cause analysis complete
+  ├─ Fix deployed + tested
+  ├─ Customers notified + compensated (if applicable)
+  ├─ Change management review completed
+  └─ Post-incident report filed
+
+
+10. COMPLIANCE AUDIT TRAIL (SOC2)
+================================================================================
+
+Data Classified:
+  ├─ Tier 1: SSN, passport, visa status (encrypt at-rest + in-transit)
+  ├─ Tier 2: Employment history, financials (encrypt at-rest)
+  └─ Tier 3: Email, IP addresses (no encryption required)
+
+Access Logged:
+  ├─ All database queries (pg_stat_statements)
+  ├─ All secrets access (Secrets Manager CloudTrail)
+  ├─ All encryption key access (KMS CloudTrail)
+  ├─ All employee logins (AWS CloudTrail)
+  └─ All API requests (application log)
+
+User Actions Tracked:
+  ├─ Form submission (encrypted, timestamp)
+  ├─ Form deletion (cryptographic erasure, timestamp)
+  ├─ Data export (audit log entry, timestamp)
+  └─ Password change (requires re-encryption, timestamp)
+
+Third-Party Assessments:
+  ├─ AWS: Shared Responsibility Model verified
+  ├─ OpenAI/Claude: Security whitepaper reviewed
+  ├─ Database: Encryption validated
+  └─ Network: TLS 1.3 validated (SSL Labs grade)
+
+Quarterly Reviews:
+  ├─ Access control matrix validated
+  ├─ Encryption key rotation verified
+  ├─ Backup restoration tested
+  ├─ Incident response plan drilled
+  └─ Threat model updated
+
+
+================================================================================
+SECURITY DECISION TREE
+================================================================================
+
+Question: Should we use zero-knowledge proofs?
+├─ Yes if: You want server-side validation WITHOUT decryption
+└─ No if: Performance < 100ms is critical, or complexity too high
+
+Question: Should we store plaintext data anywhere?
+└─ NO. All Tier 1 data must be encrypted at-rest and in-transit.
+
+Question: Can we send PII to Claude/OpenAI APIs?
+└─ NO. NEVER. Use redaction proxy instead.
+
+Question: Do we need MFA for employees?
+└─ YES. Zero-trust: MFA + VPN + audit logging required.
+
+Question: How often should we rotate keys?
+└─ Quarterly (automatic, transparent to users).
+
+Question: What if a user forgets their password?
+├─ Option A: No recovery (they lose access to their data)
+├─ Option B: Recovery email (backup key stored server-side, encrypted)
+└─ Choose Option A for maximum security, Option B for UX.
+
+Question: Do we need SOC2 Type II?
+└─ YES. Customers will ask. Required for enterprise sales.
+
+Question: How long should we keep audit logs?
+└─ 7 years minimum (legal requirement, some industries longer).
+
+Question: What if we get hacked?
+├─ Encrypted data is safe (attacker has ciphertext, not key)
+├─ Notify users within 24 hours (legal requirement)
+├─ Restore from backup (RTO < 1 hour target)
+└─ Post-mortem + fix deployed within 48 hours
+
+
+================================================================================
+COST-BENEFIT ANALYSIS
+================================================================================
+
+Cost of NOT implementing security:
+  ├─ Data breach: $4M+ (Verizon DBIR average)
+  ├─ Legal liability: $1-10M (class action lawsuits)
+  ├─ Regulatory fines: $27.4M (GDPR average, ~4% revenue)
+  ├─ Business closure: High probability
+  └─ Total: $5-40M+ in damages
+
+Cost of implementing security ($250K Year 1):
+  ├─ Development (4 engineers × 3 months): $200K
+  ├─ Infrastructure + compliance: $50K
+  └─ ROI: Breaks even in 12-14 months at $20K MRR
+
+Cost-Benefit Ratio: ~20:1 (prevent $20M damage for $1M cost)
+
+
+================================================================================
+Key Files Generated
+================================================================================
+
+1. SECURITY_ARCHITECTURE.md (916 lines)
+   └─ Comprehensive technical security architecture
+      └─ Encryption strategies, LLM API patterns, key management, code examples
+
+2. SECURITY_IMPLEMENTATION_CHECKLIST.md (715 lines)
+   └─ Step-by-step implementation roadmap
+      └─ Phase 1-4 (MVP → SOC2 compliance), with checklists
+
+3. SECURITY_SUMMARY.txt (350 lines)
+   └─ Executive summary & quick reference
+      └─ Key decisions, go/no-go recommendation, cost breakdown
+
+4. SECURITY_ARCHITECTURE_DIAGRAM.txt (this file)
+   └─ Visual diagrams of security flows
+      └─ Data flow, key management, compliance audit trail
+
+================================================================================
